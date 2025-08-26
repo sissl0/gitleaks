@@ -127,6 +127,7 @@ func NewDetector(cfg config.Config) *Detector {
 
 // NewDetectorDefaultConfig creates a new detector with the default config
 func NewDetectorDefaultConfig() (*Detector, error) {
+	fmt.Println("Using Fork")
 	viper.SetConfigType("toml")
 	err := viper.ReadConfig(strings.NewReader(config.DefaultConfig))
 	if err != nil {
