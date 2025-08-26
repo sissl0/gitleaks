@@ -1,4 +1,4 @@
-module github.com/sissl0/gitleaks
+module github.com/zricethezav/gitleaks/v8
 
 go 1.23.8
 
