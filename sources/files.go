@@ -2,13 +2,17 @@ package sources
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
 
 	"github.com/fatih/semgroup"
+	"github.com/sissl0/DockerAnalysis/pkg/database"
 	"github.com/zricethezav/gitleaks/v8/config"
 	"github.com/zricethezav/gitleaks/v8/logging"
 )
@@ -19,32 +23,6 @@ type ScanTarget struct {
 	Symlink string
 }
 
-// Deprecated: Use Files and detector.DetectSource instead
-func DirectoryTargets(sourcePath string, s *semgroup.Group, followSymlinks bool, allowlists []*config.Allowlist) (<-chan ScanTarget, error) {
-	paths := make(chan ScanTarget)
-
-	// create a Files source
-	files := Files{
-		FollowSymlinks: followSymlinks,
-		Path:           sourcePath,
-		Sema:           s,
-		Config: &config.Config{
-			Allowlists: allowlists,
-		},
-	}
-
-	s.Go(func() error {
-		err := files.scanTargets(func(scanTarget ScanTarget, err error) error {
-			paths <- scanTarget
-			return nil
-		})
-		close(paths)
-		return err
-	})
-
-	return paths, nil
-}
-
 // Files is a source for yielding fragments from a collection of files
 type Files struct {
 	Config          *config.Config
@@ -53,17 +31,22 @@ type Files struct {
 	Path            string
 	Sema            *semgroup.Group
 	MaxArchiveDepth int
+	Writer          *database.RotatingJSONLWriter
+	Digest          string
 }
 
 // scanTargets yields scan targets to a callback func
 func (s *Files) scanTargets(yield func(ScanTarget, error) error) error {
-	return filepath.WalkDir(s.Path, func(path string, d fs.DirEntry, err error) error {
+	var fileCount int = 0
+	var fileHashes []string = []string{}
+	var maxDepth int = 0
+
+	err := filepath.WalkDir(s.Path, func(path string, d fs.DirEntry, err error) error {
 		scanTarget := ScanTarget{Path: path}
 		logger := logging.With().Str("path", path).Logger()
 
 		if err != nil {
 			if os.IsPermission(err) {
-				// This seems to only fail on directories at this stage.
 				logger.Warn().Err(errors.New("permission denied")).Msg("skipping directory")
 				return filepath.SkipDir
 			}
@@ -81,6 +64,19 @@ func (s *Files) scanTargets(yield func(ScanTarget, error) error) error {
 			return nil
 		}
 
+		// Calculate directory depth
+		relativePath, err := filepath.Rel(s.Path, path)
+		if err != nil {
+			logger.Error().Err(err).Msg("could not calculate relative path")
+			return nil
+		}
+		depth := len(filepath.SplitList(relativePath))
+
+		// Update maxDepth
+		if depth > maxDepth {
+			maxDepth = depth
+		}
+
 		if !d.IsDir() {
 			// Empty; nothing to do here.
 			if info.Size() == 0 {
@@ -96,9 +92,27 @@ func (s *Files) scanTargets(yield func(ScanTarget, error) error) error {
 				)
 				return nil
 			}
+
+			// Increment file count
+			fileCount++
+
+			// Hash the file and add to fileHashes
+			file, err := os.Open(path)
+			if err != nil {
+				logger.Error().Err(err).Msg("could not open file for hashing")
+				return nil
+			}
+			defer file.Close()
+
+			hash, err := calculateFileHash(file)
+			if err != nil {
+				logger.Error().Err(err).Msg("could not hash file")
+				return nil
+			}
+			fileHashes = append(fileHashes, hash)
 		}
 
-		// set the initial scan target values
+		// Handle symlinks
 		if d.Type() == fs.ModeSymlink {
 			if !s.FollowSymlinks {
 				logger.Debug().Msg("skipping symlink: follow symlinks disabled")
@@ -119,7 +133,7 @@ func (s *Files) scanTargets(yield func(ScanTarget, error) error) error {
 			}
 		}
 
-		// handle dir cases (mainly just see if it should be skipped
+		// Handle directories
 		if info.IsDir() {
 			if shouldSkipPath(s.Config, path) {
 				logger.Debug().Msg("skipping directory: global allowlist")
@@ -135,6 +149,25 @@ func (s *Files) scanTargets(yield func(ScanTarget, error) error) error {
 
 		return yield(scanTarget, nil)
 	})
+
+	if writerERR := s.Writer.Write(map[string]any{
+		"digest":      s.Digest,
+		"file_count":  fileCount,
+		"file_hashes": fileHashes,
+		"max_depth":   maxDepth,
+	}); writerERR != nil {
+		logging.Error().Err(writerERR).Msg("could not write scan summary")
+	}
+	return err
+}
+
+// calculateFileHash calculates the hash of a file
+func calculateFileHash(file *os.File) (string, error) {
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
 // Fragments yields fragments from files discovered under the path
