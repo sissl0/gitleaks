@@ -24,7 +24,6 @@ var directoryCmd = &cobra.Command{
 
 func runDirectory(cmd *cobra.Command, args []string) {
 	// grab source
-	fmt.Println("test")
 	source := "."
 	if len(args) == 1 {
 		source = args[0]
