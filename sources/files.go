@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/fatih/semgroup"
@@ -70,7 +71,23 @@ func (s *Files) scanTargets(yield func(ScanTarget, error) error) error {
 			logger.Error().Err(err).Msg("could not calculate relative path")
 			return nil
 		}
-		depth := len(filepath.SplitList(relativePath))
+
+		// Tiefe korrekt bestimmen:
+		// "." => 0
+		// "a" => 1
+		// "a/b" => 2
+		// Für Dateien wird der Dateiname nicht zur Verzeichnistiefe gezählt.
+		var depth int
+		if relativePath == "." {
+			depth = 0
+		} else {
+			parts := strings.Split(relativePath, string(os.PathSeparator))
+			if !d.IsDir() && len(parts) > 0 {
+				depth = len(parts) - 1 // Datei nicht mitzählen
+			} else {
+				depth = len(parts)
+			}
+		}
 
 		// Update maxDepth
 		if depth > maxDepth {
