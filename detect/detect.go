@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -104,6 +105,14 @@ type Detector struct {
 	Reporter   report.Reporter
 
 	TotalBytes atomic.Uint64
+
+	// Matched Keyword and regex-only traversal
+	ruleIDs          []string
+	ruleIDIndex      map[string]int
+	keywordToRuleIdx map[string][]int
+	regexOnlyIdx     []int
+	used             []bool //Global to avoid reallocation, for parallel Detect calls, define local in Detect
+	candidates       []int
 }
 
 // Fragment is an alias for sources.Fragment for backwards compatibility
@@ -142,6 +151,40 @@ func NewDetectorDefaultConfig() (*Detector, error) {
 		return nil, err
 	}
 	return NewDetector(cfg), nil
+}
+
+func (d *Detector) BuildRuleIndex() {
+	var ids []string
+	for id := range d.Config.Rules {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	ruleIDIndex := make(map[string]int, len(ids))
+	for i, id := range ids {
+		ruleIDIndex[id] = i
+	}
+	keywordToRuleIdx := make(map[string][]int)
+	var regexOnlyIdx []int
+	for _, id := range ids {
+		r := d.Config.Rules[id]
+		if len(r.Keywords) == 0 {
+			regexOnlyIdx = append(regexOnlyIdx, ruleIDIndex[id])
+			continue
+		}
+		for _, kw := range r.Keywords {
+			kw = strings.ToLower(strings.TrimSpace(kw))
+			if kw == "" {
+				continue
+			}
+			keywordToRuleIdx[kw] = append(keywordToRuleIdx[kw], ruleIDIndex[id])
+		}
+	}
+	d.ruleIDs = ids
+	d.ruleIDIndex = ruleIDIndex
+	d.keywordToRuleIdx = keywordToRuleIdx
+	d.regexOnlyIdx = regexOnlyIdx
+	d.used = make([]bool, len(ids))
+	d.candidates = make([]int, 0, 32)
 }
 
 func (d *Detector) AddGitleaksIgnore(gitleaksIgnorePath string) error {
@@ -292,6 +335,15 @@ func (d *Detector) Detect(fragment Fragment) []report.Finding {
 		return findings
 	}
 
+	// Precompute newline indices once per Fragment (replaces Regex newLineRegexp.FindAllStringIndex (once per Rule))
+	// Not per currentRaw because matchIndex = codec.AdjustMatchIndex(segments, matchIndex) resets to original fragment.Raw Indices
+	newlineIndices := make([][]int, 0, 64)
+	for i := 0; i < len(fragment.Raw); i++ {
+		if fragment.Raw[i] == '\n' {
+			newlineIndices = append(newlineIndices, []int{i, i + 1})
+		}
+	}
+
 	// setup variables to handle different decoding passes
 	currentRaw := fragment.Raw
 	encodedSegments := []*codec.EncodedSegment{}
@@ -299,30 +351,44 @@ func (d *Detector) Detect(fragment Fragment) []report.Finding {
 	decoder := codec.NewDecoder()
 
 	for {
-		// build keyword map for prefiltering rules
-		keywords := make(map[string]bool)
+		// Only traverse Candidates not all Rules, prefiltered by Aho-Corasick to find keyword matches faster
+		// Only Regex-only rules will be checked against all fragments
+		// Used, []bool to prevent duplicate rule checks when multiple keywords from the same rule match (Unlikely but possible)
+
 		normalizedRaw := strings.ToLower(currentRaw)
 		matches := d.prefilter.MatchString(normalizedRaw)
+		//fmt.Printf("Scanning %s\n", fragment.FilePath)
+		// Keyword matches
 		for _, m := range matches {
-			keywords[normalizedRaw[m.Pos():int(m.Pos())+len(m.Match())]] = true
-		}
-
-		for _, rule := range d.Config.Rules {
-			if len(rule.Keywords) == 0 {
-				// if no keywords are associated with the rule always scan the
-				// fragment using the rule
-				findings = append(findings, d.detectRule(fragment, currentRaw, rule, encodedSegments)...)
-				continue
-			}
-
-			// check if keywords are in the fragment
-			for _, k := range rule.Keywords {
-				if _, ok := keywords[strings.ToLower(k)]; ok {
-					findings = append(findings, d.detectRule(fragment, currentRaw, rule, encodedSegments)...)
-					break
+			kw := normalizedRaw[m.Pos() : int(m.Pos())+len(m.Match())]
+			if idxs, ok := d.keywordToRuleIdx[kw]; ok {
+				for _, ri := range idxs {
+					if d.used[ri] {
+						continue
+					}
+					d.used[ri] = true
+					d.candidates = append(d.candidates, ri)
+					ruleID := d.ruleIDs[ri]
+					rule := d.Config.Rules[ruleID]
+					findings = append(findings, d.detectRule(fragment, currentRaw, rule, encodedSegments, newlineIndices)...)
 				}
 			}
 		}
+
+		// Regex-only
+		if currentDecodeDepth == 0 {
+			for _, ri := range d.regexOnlyIdx {
+				ruleID := d.ruleIDs[ri]
+				rule := d.Config.Rules[ruleID]
+				findings = append(findings, d.detectRule(fragment, currentRaw, rule, encodedSegments, newlineIndices)...)
+			}
+		}
+
+		// reset
+		for _, ri := range d.candidates {
+			d.used[ri] = false
+		}
+		d.candidates = d.candidates[:0]
 
 		// increment the depth by 1 as we start our decoding pass
 		currentDecodeDepth++
@@ -345,7 +411,7 @@ func (d *Detector) Detect(fragment Fragment) []report.Finding {
 }
 
 // detectRule scans the given fragment for the given rule and returns a list of findings
-func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rule, encodedSegments []*codec.EncodedSegment) []report.Finding {
+func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rule, encodedSegments []*codec.EncodedSegment, newlineIndices [][]int) []report.Finding {
 	var (
 		findings []report.Finding
 		logger   = func() zerolog.Logger {
@@ -357,7 +423,7 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 		}()
 	)
 
-	if r.SkipReport == true && !fragment.InheritedFromFinding {
+	if r.SkipReport && !fragment.InheritedFromFinding {
 		return findings
 	}
 
@@ -421,12 +487,11 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 		return findings
 	}
 
-	// TODO profile this, probably should replace with something more efficient
-	newlineIndices := newLineRegexp.FindAllStringIndex(fragment.Raw, -1)
-
 	// use currentRaw instead of fragment.Raw since this represents the current
 	// decoding pass on the text
-	for _, matchIndex := range r.Regex.FindAllStringIndex(currentRaw, -1) {
+
+	// Unecessary to calc r.Regex.FindAllStringIndex(currentRaw, -1) again
+	for _, matchIndex := range matches {
 		// Extract secret from match
 		secret := strings.Trim(currentRaw[matchIndex[0]:matchIndex[1]], "\n")
 
@@ -519,15 +584,13 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 		// check entropy
 		entropy := shannonEntropy(finding.Secret)
 		finding.Entropy = float32(entropy)
-		if r.Entropy != 0.0 {
-			// entropy is too low, skip this finding
-			if entropy <= r.Entropy {
-				logger.Trace().
-					Str("finding", finding.Secret).
-					Float32("entropy", finding.Entropy).
-					Msg("skipping finding: low entropy")
-				continue
-			}
+		if r.Entropy != 0.0 && entropy <= r.Entropy {
+			logger.Trace().
+				Str("finding", finding.Secret).
+				Float32("entropy", finding.Entropy).
+				Msg("skipping finding: low entropy")
+			continue
+
 		}
 
 		// check if the result matches any of the global allowlists.
@@ -550,11 +613,11 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 	}
 
 	// Process required rules and create findings with auxiliary findings
-	return d.processRequiredRules(fragment, currentRaw, r, encodedSegments, findings, logger)
+	return d.processRequiredRules(fragment, currentRaw, r, encodedSegments, findings, newlineIndices, logger)
 }
 
 // processRequiredRules handles the logic for multi-part rules with auxiliary findings
-func (d *Detector) processRequiredRules(fragment Fragment, currentRaw string, r config.Rule, encodedSegments []*codec.EncodedSegment, primaryFindings []report.Finding, logger zerolog.Logger) []report.Finding {
+func (d *Detector) processRequiredRules(fragment Fragment, currentRaw string, r config.Rule, encodedSegments []*codec.EncodedSegment, primaryFindings []report.Finding, newlineIndices [][]int, logger zerolog.Logger) []report.Finding {
 	if len(primaryFindings) == 0 {
 		logger.Debug().Msg("no primary findings to process for required rules")
 		return primaryFindings
@@ -575,7 +638,7 @@ func (d *Detector) processRequiredRules(fragment Fragment, currentRaw string, r 
 		inheritedFragment.InheritedFromFinding = true
 
 		// Call detectRule once for each required rule
-		requiredFindings := d.detectRule(inheritedFragment, currentRaw, rule, encodedSegments)
+		requiredFindings := d.detectRule(inheritedFragment, currentRaw, rule, encodedSegments, newlineIndices)
 		allRequiredFindings[requiredRule.RuleID] = requiredFindings
 
 		logger.Debug().

@@ -63,8 +63,8 @@ func (s *File) Fragments(ctx context.Context, yield FragmentsFunc) error {
 				).Int(
 					"max_archive_depth", s.MaxArchiveDepth,
 				).Msg("skipping archive: exceeds max archive depth")
+				return nil
 			}
-			return nil
 		}
 		if extractor, ok := format.(archives.Extractor); ok {
 			return s.extractorFragments(ctx, extractor, s.Content, yield)
@@ -107,7 +107,6 @@ func (s *File) extractorFragments(ctx context.Context, extractor archives.Extrac
 		if d.IsDir() {
 			return nil
 		}
-
 		innerReader, err := d.Open()
 		if err != nil {
 			logging.Error().Err(err).Str("path", s.FullPath()).Msg("could not open archive inner file")
