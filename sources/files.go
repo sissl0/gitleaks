@@ -9,11 +9,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/fatih/semgroup"
-	"github.com/sissl0/DockerAnalysis/pkg/database"
 	"github.com/zricethezav/gitleaks/v8/config"
 	"github.com/zricethezav/gitleaks/v8/logging"
 )
@@ -32,15 +30,11 @@ type Files struct {
 	Path            string
 	Sema            *semgroup.Group
 	MaxArchiveDepth int
-	Writer          *database.RotatingJSONLWriter
 	Digest          string
 }
 
 // scanTargets yields scan targets to a callback func
 func (s *Files) scanTargets(yield func(ScanTarget, error) error) error {
-	var fileCount int = 0
-	var fileHashes []string = []string{}
-	var maxDepth int = 0
 
 	err := filepath.WalkDir(s.Path, func(path string, d fs.DirEntry, err error) error {
 		scanTarget := ScanTarget{Path: path}
@@ -65,35 +59,6 @@ func (s *Files) scanTargets(yield func(ScanTarget, error) error) error {
 			return nil
 		}
 
-		// Calculate directory depth
-		relativePath, err := filepath.Rel(s.Path, path)
-		if err != nil {
-			logger.Error().Err(err).Msg("could not calculate relative path")
-			return nil
-		}
-
-		// Tiefe korrekt bestimmen:
-		// "." => 0
-		// "a" => 1
-		// "a/b" => 2
-		// Für Dateien wird der Dateiname nicht zur Verzeichnistiefe gezählt.
-		var depth int
-		if relativePath == "." {
-			depth = 0
-		} else {
-			parts := strings.Split(relativePath, string(os.PathSeparator))
-			if !d.IsDir() && len(parts) > 0 {
-				depth = len(parts) - 1 // Datei nicht mitzählen
-			} else {
-				depth = len(parts)
-			}
-		}
-
-		// Update maxDepth
-		if depth > maxDepth {
-			maxDepth = depth
-		}
-
 		if !d.IsDir() {
 			// Empty; nothing to do here.
 			if info.Size() == 0 {
@@ -109,24 +74,6 @@ func (s *Files) scanTargets(yield func(ScanTarget, error) error) error {
 				)
 				return nil
 			}
-
-			// Increment file count
-			fileCount++
-
-			// Hash the file and add to fileHashes
-			file, err := os.Open(path)
-			if err != nil {
-				logger.Error().Err(err).Msg("could not open file for hashing")
-				return nil
-			}
-			defer file.Close()
-
-			hash, err := calculateFileHash(file)
-			if err != nil {
-				logger.Error().Err(err).Msg("could not hash file")
-				return nil
-			}
-			fileHashes = append(fileHashes, hash)
 		}
 
 		// Handle symlinks
@@ -167,14 +114,6 @@ func (s *Files) scanTargets(yield func(ScanTarget, error) error) error {
 		return yield(scanTarget, nil)
 	})
 
-	if writerERR := s.Writer.Write(map[string]any{
-		"digest":      s.Digest,
-		"file_count":  fileCount,
-		"file_hashes": fileHashes,
-		"max_depth":   maxDepth,
-	}); writerERR != nil {
-		logging.Error().Err(writerERR).Msg("could not write scan summary")
-	}
 	return err
 }
 
