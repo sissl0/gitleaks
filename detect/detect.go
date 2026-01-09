@@ -13,7 +13,6 @@ import (
 	"github.com/zricethezav/gitleaks/v8/config"
 	"github.com/zricethezav/gitleaks/v8/detect/codec"
 	"github.com/zricethezav/gitleaks/v8/logging"
-	"github.com/zricethezav/gitleaks/v8/regexp"
 	"github.com/zricethezav/gitleaks/v8/report"
 	"github.com/zricethezav/gitleaks/v8/sources"
 
@@ -29,10 +28,10 @@ const (
 	// SlowWarningThreshold is the amount of time to wait before logging that a file is slow.
 	// This is useful for identifying problematic files and tuning the allowlist.
 	SlowWarningThreshold = 5 * time.Second
-)
-
-var (
-	newLineRegexp = regexp.MustCompile("\n")
+	// baseWindowSize is the minimum number of characters before/after a keyword match to search
+	baseWindowSize = 100
+	// windowMultiplier scales the window size based on the longest keyword match
+	windowMultiplier = 50
 )
 
 // Detector is the main detector struct
@@ -85,7 +84,7 @@ type Detector struct {
 
 	// prefilter is a ahocorasick struct used for doing efficient string
 	// matching given a set of words (keywords from the rules in the config)
-	prefilter ahocorasick.Trie
+	prefilter *ahocorasick.Trie
 
 	// a list of known findings that should be ignored
 	baseline []report.Finding
@@ -104,12 +103,24 @@ type Detector struct {
 	Reporter   report.Reporter
 
 	TotalBytes atomic.Uint64
+
+	// keywordToRules maps keywords to rules
+	keywordToRules map[string][]*config.Rule
+
+	// rulesWithoutKeywords is a list of rules without keywords
+	rulesWithoutKeywords []*config.Rule
 }
 
 // Fragment is an alias for sources.Fragment for backwards compatibility
 //
 // Deprecated: This will be replaced with sources.Fragment in v9
 type Fragment sources.Fragment
+
+type KeywordMatch struct {
+	Keyword  string
+	StartPos int
+	EndPos   int
+}
 
 // NewDetector creates a new detector with the given config
 func NewDetector(cfg config.Config) *Detector {
@@ -119,15 +130,47 @@ func NewDetector(cfg config.Config) *Detector {
 // NewDetectorContext is the same as NewDetector but supports passing in a
 // context to use for timeouts
 func NewDetectorContext(ctx context.Context, cfg config.Config) *Detector {
+	// Handle nil rules map
+	if cfg.Rules == nil {
+		cfg.Rules = make(map[string]config.Rule)
+	}
+
+	// Build keyword to rules mapping
+	keywordToRules := make(map[string][]*config.Rule)
+	var rulesWithoutKeywords []*config.Rule
+
+	for ruleID, rule := range cfg.Rules {
+		ruleCopy := rule
+
+		if len(rule.Keywords) == 0 {
+			rulesWithoutKeywords = append(rulesWithoutKeywords, &ruleCopy)
+		} else {
+			for _, k := range rule.Keywords {
+				lowerK := strings.ToLower(k)
+				keywordToRules[lowerK] = append(keywordToRules[lowerK], &ruleCopy)
+			}
+		}
+		cfg.Rules[ruleID] = ruleCopy
+	}
+
+	// Build prefilter only if we have keywords
+	var prefilter *ahocorasick.Trie
+	if len(keywordToRules) > 0 {
+		trie := ahocorasick.NewTrieBuilder().AddStrings(maps.Keys(keywordToRules)).Build()
+		prefilter = trie
+	}
+
 	return &Detector{
-		commitMap:      make(map[string]bool),
-		gitleaksIgnore: make(map[string]struct{}),
-		findingMutex:   &sync.Mutex{},
-		commitMutex:    &sync.Mutex{},
-		findings:       make([]report.Finding, 0),
-		Config:         cfg,
-		prefilter:      *ahocorasick.NewTrieBuilder().AddStrings(maps.Keys(cfg.Keywords)).Build(),
-		Sema:           semgroup.NewGroup(ctx, 40),
+		commitMap:            make(map[string]bool),
+		gitleaksIgnore:       make(map[string]struct{}),
+		findingMutex:         &sync.Mutex{},
+		commitMutex:          &sync.Mutex{},
+		findings:             make([]report.Finding, 0),
+		Config:               cfg,
+		prefilter:            prefilter,
+		keywordToRules:       keywordToRules,
+		rulesWithoutKeywords: rulesWithoutKeywords,
+		Sema:                 semgroup.NewGroup(ctx, 40),
 	}
 }
 
@@ -304,11 +347,26 @@ func (d *Detector) DetectContext(ctx context.Context, fragment Fragment) []repor
 		return findings
 	}
 
+	// Early size check. Was in detectRule
+	if d.MaxTargetMegaBytes > 0 {
+		rawLengthMB := len(fragment.Raw) / 1_000_000
+		if rawLengthMB > d.MaxTargetMegaBytes {
+			logger.Debug().
+				Int("size-mb", rawLengthMB).
+				Int("max-size-mb", d.MaxTargetMegaBytes).
+				Msg("skipping fragment: original content exceeds size limit")
+			return findings
+		}
+	}
+
 	// setup variables to handle different decoding passes
 	currentRaw := fragment.Raw
 	encodedSegments := []*codec.EncodedSegment{}
 	currentDecodeDepth := 0
 	decoder := codec.NewDecoder()
+
+	// Precompute newline indices once per Fragment
+	var newlineIndices [][]int
 
 ScanLoop:
 	for {
@@ -316,33 +374,65 @@ ScanLoop:
 		case <-ctx.Done():
 			break ScanLoop
 		default:
-			// build keyword map for prefiltering rules
-			keywords := make(map[string]bool)
-			normalizedRaw := strings.ToLower(currentRaw)
-			matches := d.prefilter.MatchString(normalizedRaw)
-			for _, m := range matches {
-				keywords[normalizedRaw[m.Pos():int(m.Pos())+len(m.Match())]] = true
+
+			// Lazy compute newlines on first iteration only
+			if newlineIndices == nil {
+				newlineIndices = computeNewlineIndices(fragment.Raw)
 			}
 
-			for _, rule := range d.Config.Rules {
+			// Map rules to their keyword match positions for THIS iteration
+			ruleKeywordMatches := make(map[*config.Rule][]KeywordMatch)
+
+			// Always include rules without keywords
+			for _, rule := range d.rulesWithoutKeywords {
+				ruleKeywordMatches[rule] = nil
+			}
+
+			// Only run Aho-Corasick if we have a prefilter
+			if d.prefilter != nil {
+				normalizedRaw := strings.ToLower(currentRaw)
+				acMatches := d.prefilter.MatchString(normalizedRaw)
+
+				// Track seen matches to avoid duplicates
+				seenMatches := make(map[string]bool)
+
+				// Add rules that match keywords current decoded content
+				for _, m := range acMatches {
+					startPos := int(m.Pos())
+					endPos := startPos + len(m.Match())
+
+					// Validate bounds for UTF-8 safety
+					if endPos > len(normalizedRaw) {
+						continue
+					}
+
+					keyword := normalizedRaw[startPos:endPos]
+
+					// Deduplicate keyword matches
+					matchKey := fmt.Sprintf("%s:%d", keyword, startPos)
+					if seenMatches[matchKey] {
+						continue
+					}
+					seenMatches[matchKey] = true
+
+					km := KeywordMatch{
+						Keyword:  keyword,
+						StartPos: startPos,
+						EndPos:   endPos,
+					}
+					for _, rule := range d.keywordToRules[keyword] {
+						ruleKeywordMatches[rule] = append(ruleKeywordMatches[rule], km)
+					}
+				}
+			}
+
+			// Run rules with keyword positions from current decode pass
+			for rule, keywordMatches := range ruleKeywordMatches {
 				select {
 				case <-ctx.Done():
 					break ScanLoop
 				default:
-					if len(rule.Keywords) == 0 {
-						// if no keywords are associated with the rule always scan the
-						// fragment using the rule
-						findings = append(findings, d.detectRule(fragment, currentRaw, rule, encodedSegments)...)
-						continue
-					}
-
-					// check if keywords are in the fragment
-					for _, k := range rule.Keywords {
-						if _, ok := keywords[strings.ToLower(k)]; ok {
-							findings = append(findings, d.detectRule(fragment, currentRaw, rule, encodedSegments)...)
-							break
-						}
-					}
+					findings = append(findings, d.detectRule(fragment, currentRaw, *rule, encodedSegments, newlineIndices, keywordMatches)...)
 				}
 			}
 
@@ -361,6 +451,18 @@ ScanLoop:
 			if len(encodedSegments) == 0 {
 				break ScanLoop
 			}
+			// Check size of decoded content. Might expand during decoding
+			if d.MaxTargetMegaBytes > 0 && currentDecodeDepth > 0 {
+				currentRawLengthMB := len(currentRaw) / 1_000_000
+				if currentRawLengthMB > d.MaxTargetMegaBytes {
+					logger.Debug().
+						Int("size-mb", currentRawLengthMB).
+						Int("max-size-mb", d.MaxTargetMegaBytes).
+						Int("decode-depth", currentDecodeDepth).
+						Msg("skipping fragment: decoded content exceeds size limit")
+					break ScanLoop
+				}
+			}
 		}
 	}
 
@@ -368,7 +470,14 @@ ScanLoop:
 }
 
 // detectRule scans the given fragment for the given rule and returns a list of findings
-func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rule, encodedSegments []*codec.EncodedSegment) []report.Finding {
+func (d *Detector) detectRule(
+	fragment Fragment,
+	currentRaw string,
+	r config.Rule,
+	encodedSegments []*codec.EncodedSegment,
+	newlineIndices [][]int,
+	keywordMatches []KeywordMatch,
+) []report.Finding {
 	var (
 		findings []report.Finding
 		logger   = func() zerolog.Logger {
@@ -379,6 +488,16 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 			return l.Logger()
 		}()
 	)
+
+	// Fallback for tests
+	if newlineIndices == nil {
+		newlineIndices = computeNewlineIndices(fragment.Raw)
+	}
+
+	// Fallback for tests
+	if keywordMatches == nil {
+		keywordMatches = []KeywordMatch{}
+	}
 
 	if r.SkipReport && !fragment.InheritedFromFinding {
 		return findings
@@ -392,7 +511,8 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 
 	if r.Path != nil {
 		if r.Regex == nil && len(encodedSegments) == 0 {
-			// Path _only_ rule
+			// Path _only_ rule - only runs on first pass (no encoded segments)
+			// This is intentional: path rules don't depend on content
 			if r.Path.MatchString(fragment.FilePath) || (fragment.WindowsFilePath != "" && r.Path.MatchString(fragment.WindowsFilePath)) {
 				finding := report.Finding{
 					Commit:      fragment.CommitSHA,
@@ -427,29 +547,68 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 		return findings
 	}
 
-	// if flag configure and raw data size bigger then the flag
-	if d.MaxTargetMegaBytes > 0 {
-		rawLength := len(currentRaw) / 1_000_000
-		if rawLength > d.MaxTargetMegaBytes {
-			logger.Debug().
-				Int("size", rawLength).
-				Int("max-size", d.MaxTargetMegaBytes).
-				Msg("skipping fragment: size")
-			return findings
+	// Use keyword positions to limit regex search scope
+	var matches [][]int
+	if len(keywordMatches) > 0 {
+		// Calculate dynamic window size based on longest keyword match. keywordMatches should be small
+		longestKeyword := 0
+		for _, km := range keywordMatches {
+			keywordLen := km.EndPos - km.StartPos
+			if keywordLen > longestKeyword {
+				longestKeyword = keywordLen
+			}
 		}
+		dynamicWindowSize := baseWindowSize + (longestKeyword * windowMultiplier)
+
+		// Search in windows around each keyword match
+		searchedRegions := make(map[int]bool) // Track which regions we've searched
+		seenMatches := make(map[string]bool)  // Track unique matches to avoid duplicates
+
+		for _, km := range keywordMatches {
+			// Calculate search window with dynamic size
+			start := km.StartPos - dynamicWindowSize
+			if start < 0 {
+				start = 0
+			}
+
+			end := km.EndPos + dynamicWindowSize
+			if end > len(currentRaw) {
+				end = len(currentRaw)
+			}
+
+			// Use region key to deduplicate overlapping windows
+			regionKey := start / dynamicWindowSize
+			if searchedRegions[regionKey] {
+				continue
+			}
+			searchedRegions[regionKey] = true
+
+			// Search only in this window
+			windowMatches := r.Regex.FindAllStringIndex(currentRaw[start:end], -1)
+			for _, m := range windowMatches {
+				// Adjust positions back to full string coordinates
+				adjustedMatch := []int{start + m[0], start + m[1]}
+
+				// Deduplicate matches by position
+				matchKey := fmt.Sprintf("%d:%d", adjustedMatch[0], adjustedMatch[1])
+				if !seenMatches[matchKey] {
+					seenMatches[matchKey] = true
+					matches = append(matches, adjustedMatch)
+				}
+			}
+		}
+	} else {
+		// No keywords, search entire currentRaw
+		matches = r.Regex.FindAllStringIndex(currentRaw, -1)
 	}
 
-	matches := r.Regex.FindAllStringIndex(currentRaw, -1)
 	if len(matches) == 0 {
 		return findings
 	}
 
-	// TODO profile this, probably should replace with something more efficient
-	newlineIndices := newLineRegexp.FindAllStringIndex(fragment.Raw, -1)
-
 	// use currentRaw instead of fragment.Raw since this represents the current
 	// decoding pass on the text
-	for _, matchIndex := range r.Regex.FindAllStringIndex(currentRaw, -1) {
+	for _, matchIndex := range matches {
 		// Extract secret from match
 		secret := strings.Trim(currentRaw[matchIndex[0]:matchIndex[1]], "\n")
 
@@ -573,11 +732,19 @@ func (d *Detector) detectRule(fragment Fragment, currentRaw string, r config.Rul
 	}
 
 	// Process required rules and create findings with auxiliary findings
-	return d.processRequiredRules(fragment, currentRaw, r, encodedSegments, findings, logger)
+	return d.processRequiredRules(fragment, currentRaw, r, encodedSegments, findings, newlineIndices, logger)
 }
 
 // processRequiredRules handles the logic for multi-part rules with auxiliary findings
-func (d *Detector) processRequiredRules(fragment Fragment, currentRaw string, r config.Rule, encodedSegments []*codec.EncodedSegment, primaryFindings []report.Finding, logger zerolog.Logger) []report.Finding {
+func (d *Detector) processRequiredRules(
+	fragment Fragment,
+	currentRaw string,
+	r config.Rule,
+	encodedSegments []*codec.EncodedSegment,
+	primaryFindings []report.Finding,
+	newlineIndices [][]int,
+	logger zerolog.Logger,
+) []report.Finding {
 	if len(primaryFindings) == 0 {
 		logger.Debug().Msg("no primary findings to process for required rules")
 		return primaryFindings
@@ -597,8 +764,32 @@ func (d *Detector) processRequiredRules(fragment Fragment, currentRaw string, r 
 		inheritedFragment := fragment
 		inheritedFragment.InheritedFromFinding = true
 
-		// Call detectRule once for each required rule
-		requiredFindings := d.detectRule(inheritedFragment, currentRaw, rule, encodedSegments)
+		// Compute keyword matches specific to this required rule
+		var requiredKeywordMatches []KeywordMatch
+		if len(rule.Keywords) > 0 {
+			normalizedRaw := strings.ToLower(currentRaw)
+			for _, kw := range rule.Keywords {
+				lowerKw := strings.ToLower(kw)
+				// Find all occurrences of this keyword
+				idx := 0
+				for {
+					pos := strings.Index(normalizedRaw[idx:], lowerKw)
+					if pos == -1 {
+						break
+					}
+					actualPos := idx + pos
+					requiredKeywordMatches = append(requiredKeywordMatches, KeywordMatch{
+						Keyword:  lowerKw,
+						StartPos: actualPos,
+						EndPos:   actualPos + len(lowerKw),
+					})
+					idx = actualPos + 1
+				}
+			}
+		}
+
+		// Call detectRule with keyword matches specific to this required rule
+		requiredFindings := d.detectRule(inheritedFragment, currentRaw, rule, encodedSegments, newlineIndices, requiredKeywordMatches)
 		allRequiredFindings[requiredRule.RuleID] = requiredFindings
 
 		logger.Debug().
@@ -658,7 +849,6 @@ func (d *Detector) processRequiredRules(fragment Fragment, currentRaw string, r 
 // hasAllRequiredRules checks if we have at least one auxiliary finding for each required rule
 func (d *Detector) hasAllRequiredRules(auxiliaryFindings []*report.RequiredFinding, requiredRules []*config.Required) bool {
 	foundRules := make(map[string]bool)
-	// AuxiliaryFinding
 	for _, aux := range auxiliaryFindings {
 		foundRules[aux.RuleID] = true
 	}
@@ -673,7 +863,6 @@ func (d *Detector) hasAllRequiredRules(auxiliaryFindings []*report.RequiredFindi
 }
 
 func (d *Detector) withinProximity(primary, required report.Finding, requiredRule *config.Required) bool {
-	// fmt.Println(requiredRule.WithinLines)
 	// If neither within_lines nor within_columns is set, findings just need to be in the same fragment
 	if requiredRule.WithinLines == nil && requiredRule.WithinColumns == nil {
 		return true
@@ -888,6 +1077,22 @@ func checkFindingAllowed(
 		}
 	}
 	return false, nil
+}
+
+// computeNewlineIndices finds newline positions without regex overhead
+func computeNewlineIndices(raw string) [][]int {
+	count := strings.Count(raw, "\n")
+	if count == 0 {
+		return nil // Return nil for consistency with lazy computation check
+	}
+
+	indices := make([][]int, 0, count)
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\n' {
+			indices = append(indices, []int{i, i + 1})
+		}
+	}
+	return indices
 }
 
 func allTrue(bools []bool) bool {
