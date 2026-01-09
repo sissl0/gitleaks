@@ -104,10 +104,10 @@ type Detector struct {
 
 	TotalBytes atomic.Uint64
 
-	// keywordToRules maps keywords to rules
+	// maps keywords to rules
 	keywordToRules map[string][]*config.Rule
 
-	// rulesWithoutKeywords is a list of rules without keywords
+	// list of rules without keywords
 	rulesWithoutKeywords []*config.Rule
 }
 
